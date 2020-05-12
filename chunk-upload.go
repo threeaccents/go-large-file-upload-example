@@ -4,14 +4,18 @@ import (
 	"bytes"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"mime/multipart"
 	"net/http"
 	"os"
+	"sort"
 	"strconv"
 )
 
 const (
 	maxChunkSize = int64(5 << 20) // 5MB
+
+	uploadDir = "./data/chunks"
 )
 
 // Chunk is a chunk of a file.
@@ -27,8 +31,9 @@ type Chunk struct {
 	UploadDir     string
 }
 
-func processChunk(r *http.Request) error {
-	chunk, err := parseChunk(r)
+// ProcessChunk will parse the chunk data from the request and store in a file on disk.
+func ProcessChunk(r *http.Request) error {
+	chunk, err := ParseChunk(r)
 	if err != nil {
 		return fmt.Errorf("failed to parse chunk %w", err)
 	}
@@ -38,14 +43,46 @@ func processChunk(r *http.Request) error {
 		return err
 	}
 
-	if err := storeChunk(chunk); err != nil {
+	if err := StoreChunk(chunk); err != nil {
 		return err
 	}
 
 	return nil
 }
 
-func parseChunk(r *http.Request) (*Chunk, error) {
+// CompleteChunk rebulds the file chunks into the original full file.
+// It then stores the file on disk.
+func CompleteChunk(uploadID, filename string) error {
+	uploadDir := fmt.Sprintf("%s/%s", uploadDir, uploadID)
+
+	f, err := RebuildFile(uploadDir)
+	if err != nil {
+		return fmt.Errorf("failed to rebuild file %w", err)
+	}
+	// we might also want to delete the temp file from disk.
+	// It would be handy to create a struct with a close method that closes and deletes the temp file.
+	defer f.Close()
+
+	// here we can just keep our file on disk
+	// or do any processing we want such as resizing, tagging, storing in a cloud storage.
+	// to keep this simple we'll just store the file on disk.
+
+	newFile, err := os.Create(filename)
+	if err != nil {
+		return fmt.Errorf("failed creating file %w", err)
+	}
+	defer newFile.Close()
+
+	if _, err := io.Copy(newFile, f); err != nil {
+		return fmt.Errorf("failed copying file contents %w", err)
+	}
+
+	return nil
+}
+
+// ParseChunk parse the request body and creates our chunk struct. It expects the data to be sent in a
+// specific order and handles validating the order.
+func ParseChunk(r *http.Request) (*Chunk, error) {
 	var chunk Chunk
 
 	buf := new(bytes.Buffer)
@@ -72,7 +109,7 @@ func parseChunk(r *http.Request) (*Chunk, error) {
 	buf.Reset()
 
 	// dir to where we store our chunk
-	chunk.UploadDir = fmt.Sprintf("./data/chunks/%s", chunk.UploadID)
+	chunk.UploadDir = fmt.Sprintf("%s/%s", uploadDir, chunk.UploadID)
 
 	// 2
 	if err := getPart("chunk_number", reader, buf); err != nil {
@@ -132,13 +169,66 @@ func parseChunk(r *http.Request) (*Chunk, error) {
 	return &chunk, nil
 }
 
-func storeChunk(chunk *Chunk) error {
+// StoreChunk stores the chunk on disk for it to later be processed when all other file chunks have been uploaded.
+func StoreChunk(chunk *Chunk) error {
 	chunkFile, err := os.Create(fmt.Sprintf("%s/%d", chunk.UploadDir, chunk.ChunkNumber))
 	if err != nil {
 		return err
 	}
 
 	if _, err := io.CopyN(chunkFile, chunk.Data, maxChunkSize); err != nil && err != io.EOF {
+		return err
+	}
+
+	return nil
+}
+
+// ByChunk is a helper type to sort the files by name. Since the name of the file is it's chunk number
+// it makes rebuilding the file a trivial task.
+type ByChunk []os.FileInfo
+
+func (a ByChunk) Len() int      { return len(a) }
+func (a ByChunk) Swap(i, j int) { a[i], a[j] = a[j], a[i] }
+func (a ByChunk) Less(i, j int) bool {
+	ai, _ := strconv.Atoi(a[i].Name())
+	aj, _ := strconv.Atoi(a[j].Name())
+	return ai < aj
+}
+
+// RebuildFile grabs all the files from the directory passed on concantinates them to build the original file.
+// It stores the file contents in a temp file and returns it.
+func RebuildFile(dir string) (*os.File, error) {
+	fileInfos, err := ioutil.ReadDir(uploadDir)
+	if err != nil {
+		return nil, err
+	}
+
+	fullFile, err := ioutil.TempFile("", "fullfile-")
+	if err != nil {
+		return nil, err
+	}
+
+	sort.Sort(ByChunk(fileInfos))
+	for _, fs := range fileInfos {
+		if err := appendChunk(uploadDir, fs, fullFile); err != nil {
+			return nil, err
+		}
+	}
+
+	if err := os.RemoveAll(uploadDir); err != nil {
+		return nil, err
+	}
+
+	return fullFile, nil
+}
+
+func appendChunk(uploadDir string, fs os.FileInfo, fullFile *os.File) error {
+	src, err := os.Open(uploadDir + "/" + fs.Name())
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	if _, err := io.Copy(fullFile, src); err != nil {
 		return err
 	}
 
